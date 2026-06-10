@@ -20,6 +20,11 @@ abstract class FlutterMidiProPlatform extends PlatformInterface {
     throw UnimplementedError('selectInstrument() has not been implemented.');
   }
 
+  /// Rebuilds the native audio graph after instrument changes (iOS/macOS).
+  Future<void> syncAudioEngine(int sfId) {
+    throw UnimplementedError('syncAudioEngine() has not been implemented.');
+  }
+
   Future<void> playNote(int channel, int key, int velocity, int sfId) {
     throw UnimplementedError('playNote() has not been implemented.');
   }

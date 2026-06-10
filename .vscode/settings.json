@@ -1,4 +1,5 @@
 {
     "java.configuration.updateBuildConfiguration": "interactive",
     "cmake.sourceDirectory": "C:/Users/Melih/VSCodeFlutterProjects/flutter_midi_pro/example/windows",
+    "dart.flutterSdkPath": ".fvm/versions/3.44.1"
 }

@@ -70,6 +70,11 @@ class MidiPro {
   /// The program number is the program number of the instrument on the soundfont.
   /// This is the same as the patch number.
   /// If the soundfont does not have banks, set the bank number to 0.
+  /// Rebuilds the native audio graph after batch instrument changes.
+  Future<void> syncAudioEngine({required int sfId}) {
+    return FlutterMidiProPlatform.instance.syncAudioEngine(sfId);
+  }
+
   Future<void> selectInstrument({
     /// The soundfont ID. First soundfont loaded is 1.
     required int sfId,

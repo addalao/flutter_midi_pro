@@ -21,6 +21,11 @@ class MethodChannelFlutterMidiPro extends FlutterMidiProPlatform {
   }
 
   @override
+  Future<void> syncAudioEngine(int sfId) async {
+    await _channel.invokeMethod('syncAudioEngine', {'sfId': sfId});
+  }
+
+  @override
   Future<void> playNote(int channel, int key, int velocity, int sfId) async {
     await _channel.invokeMethod(
         'playNote', {'channel': channel, 'key': key, 'velocity': velocity, 'sfId': sfId});

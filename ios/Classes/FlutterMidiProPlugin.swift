@@ -8,12 +8,56 @@ public class FlutterMidiProPlugin: NSObject, FlutterPlugin {
   private static let defaultPlaybackStandardA4 = 440.0
   private static let minPlaybackStandard = 400.0
   private static let maxPlaybackStandard = 480.0
+  private static let samplerMidiChannel: UInt8 = 0
+
+  private struct InstrumentSelection: Equatable {
+    let bank: Int
+    let program: Int
+  }
 
   var audioEngines: [Int: [AVAudioEngine]] = [:]
   var soundfontIndex = 1
   var soundfontSamplers: [Int: [AVAudioUnitSampler]] = [:]
   var soundfontURLs: [Int: URL] = [:]
+  private var selectedInstruments: [Int: [Int: InstrumentSelection]] = [:]
+  private var activeChannelKeys: Set<Int> = []
   var playbackStandardA4 = defaultPlaybackStandardA4
+
+  private func channelKey(sfId: Int, channel: Int) -> Int {
+    return sfId * 16 + channel
+  }
+
+  private func markChannelActive(sfId: Int, channel: Int) {
+    activeChannelKeys.insert(channelKey(sfId: sfId, channel: channel))
+  }
+
+  private func clearActiveChannels(for sfId: Int) {
+    activeChannelKeys = activeChannelKeys.filter { $0 / 16 != sfId }
+  }
+
+  private func ensureChannelEngineRunning(sfId: Int, channel: Int) {
+    guard let engine = audioEngines[sfId]?[channel] else {
+      return
+    }
+    markChannelActive(sfId: sfId, channel: channel)
+    if engine.isRunning {
+      return
+    }
+    do {
+      try engine.start()
+    } catch {
+      print("Failed to start channel engine for sfId \(sfId), channel \(channel): \(error)")
+    }
+  }
+
+  private func stopEngines(for sfId: Int) {
+    clearActiveChannels(for: sfId)
+    audioEngines[sfId]?.forEach { engine in
+      if engine.isRunning {
+        engine.stop()
+      }
+    }
+  }
 
   private func globalTuningCents(for a4Hz: Double) -> Float {
     return Float(1200.0 * log2(a4Hz / Self.defaultPlaybackStandardA4))
@@ -27,22 +71,146 @@ public class FlutterMidiProPlugin: NSObject, FlutterPlugin {
       }
     }
   }
-  
+
+  private func isPercussionBank(_ bank: Int) -> Bool {
+    return bank == 128
+  }
+
+  private func bankParameters(for bank: Int) -> (bankMSB: UInt8, bankLSB: UInt8) {
+    let isPercussion = isPercussionBank(bank)
+    let bankMSB: UInt8 = isPercussion ? UInt8(kAUSampler_DefaultPercussionBankMSB) : UInt8(kAUSampler_DefaultMelodicBankMSB)
+    let bankLSB: UInt8 = isPercussion ? 0 : UInt8(bank)
+    return (bankMSB, bankLSB)
+  }
+
+  private func bankLoadAttempts(for bank: Int, program: Int) -> [(bankMSB: UInt8, bankLSB: UInt8)] {
+    let bankParams = bankParameters(for: bank)
+    if isPercussionBank(bank) {
+      return [(bankParams.bankMSB, bankParams.bankLSB)]
+    }
+    if program >= 68 && program <= 73 {
+      return [
+        (0, UInt8(bank)),
+        (bankParams.bankMSB, bankParams.bankLSB),
+      ]
+    }
+    return [
+      (bankParams.bankMSB, bankParams.bankLSB),
+      (0, UInt8(bank)),
+    ]
+  }
+
+  private func loadInstrument(
+    sampler: AVAudioUnitSampler,
+    url: URL,
+    bank: Int,
+    program: Int
+  ) throws {
+    var lastError: Error?
+    for attempt in bankLoadAttempts(for: bank, program: program) {
+      do {
+        try sampler.loadSoundBankInstrument(
+          at: url,
+          program: UInt8(program),
+          bankMSB: attempt.bankMSB,
+          bankLSB: attempt.bankLSB
+        )
+        sampler.globalTuning = globalTuningCents(for: playbackStandardA4)
+        return
+      } catch {
+        lastError = error
+      }
+    }
+    throw lastError ?? NSError(
+      domain: "flutter_midi_pro",
+      code: -10851,
+      userInfo: [NSLocalizedDescriptionKey: "Failed to load soundfont preset \(program)"]
+    )
+  }
+
+  private func runOnMainThread(_ work: () throws -> Void) throws {
+    if Thread.isMainThread {
+      try work()
+      return
+    }
+    var capturedError: Error?
+    DispatchQueue.main.sync {
+      do {
+        try work()
+      } catch {
+        capturedError = error
+      }
+    }
+    if let capturedError = capturedError {
+      throw capturedError
+    }
+  }
+
+  private func applyInstrumentSelection(
+    sampler: AVAudioUnitSampler,
+    url: URL,
+    bank: Int,
+    program: Int
+  ) {
+    let bankParams = bankParameters(for: bank)
+    do {
+      try runOnMainThread {
+        try self.loadInstrument(sampler: sampler, url: url, bank: bank, program: program)
+      }
+      return
+    } catch {
+      NSLog("flutter_midi_pro: preset \(program) direct load failed, falling back to program change")
+    }
+    do {
+      try runOnMainThread {
+        try self.loadInstrument(sampler: sampler, url: url, bank: bank, program: 0)
+      }
+    } catch {
+      NSLog("flutter_midi_pro: bank root fallback load failed for bank \(bank)")
+    }
+    sampler.sendProgramChange(
+      UInt8(program),
+      bankMSB: bankParams.bankMSB,
+      bankLSB: bankParams.bankLSB,
+      onChannel: Self.samplerMidiChannel
+    )
+  }
+
+  private func startEngine(_ engine: AVAudioEngine) throws {
+    if engine.isRunning {
+      return
+    }
+    try engine.start()
+  }
+
   public static func register(with registrar: FlutterPluginRegistrar) {
     let channel = FlutterMethodChannel(name: "flutter_midi_pro", binaryMessenger: registrar.messenger())
     let instance = FlutterMidiProPlugin()
     registrar.addMethodCallDelegate(instance, channel: channel)
   }
-  
+
   public override init() {
     super.init()
+    setupAudioSession()
     setupAudioSessionNotifications()
   }
-  
+
   deinit {
     NotificationCenter.default.removeObserver(self)
   }
-  
+
+  private func setupAudioSession() {
+    do {
+      let session = AVAudioSession.sharedInstance()
+      try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+      try session.setPreferredSampleRate(44100)
+      try session.setPreferredIOBufferDuration(0.01)
+      try session.setActive(true)
+    } catch {
+      print("Failed to setup audio session: \(error)")
+    }
+  }
+
   private func setupAudioSessionNotifications() {
     NotificationCenter.default.addObserver(
       self,
@@ -50,45 +218,55 @@ public class FlutterMidiProPlugin: NSObject, FlutterPlugin {
       name: AVAudioSession.interruptionNotification,
       object: AVAudioSession.sharedInstance()
     )
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleAudioEngineConfigurationChange),
+      name: .AVAudioEngineConfigurationChange,
+      object: nil
+    )
   }
-  
+
   @objc private func handleAudioSessionInterruption(notification: Notification) {
     guard let userInfo = notification.userInfo,
           let typeValue = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
           let type = AVAudioSession.InterruptionType(rawValue: typeValue) else {
       return
     }
-    
+
     switch type {
     case .began:
-      // Interruption began - audio engines will be stopped automatically by the system
       break
     case .ended:
-      // Interruption ended - restart all audio engines
-      // Check if we should resume (if option is present and true, or if option is missing)
       var shouldResume = true
       if let optionsValue = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt {
         let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
         shouldResume = options.contains(.shouldResume)
       }
-      
+
       if shouldResume {
+        setupAudioSession()
         restartAudioEngines()
       }
     @unknown default:
       break
     }
   }
-  
+
+  @objc private func handleAudioEngineConfigurationChange(notification: Notification) {
+    restartAudioEngines()
+  }
+
   private func restartAudioEngines() {
     for (sfId, engines) in audioEngines {
-      for (index, engine) in engines.enumerated() {
-        if !engine.isRunning {
-          do {
-            try engine.start()
-          } catch {
-            print("Failed to restart audio engine for sfId \(sfId), channel \(index): \(error)")
-          }
+      for (channel, engine) in engines.enumerated() {
+        let key = channelKey(sfId: sfId, channel: channel)
+        guard activeChannelKeys.contains(key), !engine.isRunning else {
+          continue
+        }
+        do {
+          try engine.start()
+        } catch {
+          print("Failed to restart audio engine for sfId \(sfId), channel \(channel): \(error)")
         }
       }
     }
@@ -104,34 +282,28 @@ public class FlutterMidiProPlugin: NSObject, FlutterPlugin {
         let url = URL(fileURLWithPath: path)
         var chSamplers: [AVAudioUnitSampler] = []
         var chAudioEngines: [AVAudioEngine] = []
-        for _ in 0...15 {
+        var channelSelections: [Int: InstrumentSelection] = [:]
+        for channel in 0...15 {
             let sampler = AVAudioUnitSampler()
             let audioEngine = AVAudioEngine()
             audioEngine.attach(sampler)
-            audioEngine.connect(sampler, to: audioEngine.mainMixerNode, format:nil)
+            audioEngine.connect(sampler, to: audioEngine.mainMixerNode, format: nil)
             do {
-                try audioEngine.start()
-            } catch {
-                result(FlutterError(code: "AUDIO_ENGINE_START_FAILED", message: "Failed to start audio engine", details: nil))
-                return
-            }
-            do {
-                let isPercussion = (bank == 128)
-                let bankMSB: UInt8 = isPercussion ? UInt8(kAUSampler_DefaultPercussionBankMSB) : UInt8(kAUSampler_DefaultMelodicBankMSB)
-                let bankLSB: UInt8 = isPercussion ? 0 : UInt8(bank)
-                
-                try sampler.loadSoundBankInstrument(at: url, program: UInt8(program), bankMSB: bankMSB, bankLSB: bankLSB)
+                try runOnMainThread {
+                    try self.loadInstrument(sampler: sampler, url: url, bank: bank, program: program)
+                }
             } catch {
                 result(FlutterError(code: "SOUND_FONT_LOAD_FAILED1", message: "Failed to load soundfont", details: nil))
                 return
             }
-            sampler.globalTuning = globalTuningCents(for: playbackStandardA4)
             chSamplers.append(sampler)
             chAudioEngines.append(audioEngine)
+            channelSelections[channel] = InstrumentSelection(bank: bank, program: program)
         }
         soundfontSamplers[soundfontIndex] = chSamplers
         soundfontURLs[soundfontIndex] = url
         audioEngines[soundfontIndex] = chAudioEngines
+        selectedInstruments[soundfontIndex] = channelSelections
         soundfontIndex += 1
         result(soundfontIndex-1)
     case "stopAllNotes":
@@ -143,12 +315,10 @@ public class FlutterMidiProPlugin: NSObject, FlutterPlugin {
             return
         }
         soundfontSampler!.forEach { (sampler) in
-            // Sustain'i kapat (CC 64 -> 0) ve anında sesi kes (All Sound Off, CC 120 -> 0)
-            for channel in 0...15 {
-                sampler.sendController(64, withValue: 0, onChannel: UInt8(channel))
-                sampler.sendController(120, withValue: 0, onChannel: UInt8(channel))
-            }
+            sampler.sendController(64, withValue: 0, onChannel: Self.samplerMidiChannel)
+            sampler.sendController(120, withValue: 0, onChannel: Self.samplerMidiChannel)
         }
+        stopEngines(for: sfId)
         result(nil)
     case "controlChange":
         let args = call.arguments as! [String: Any]
@@ -160,7 +330,7 @@ public class FlutterMidiProPlugin: NSObject, FlutterPlugin {
             result(FlutterError(code: "SOUND_FONT_NOT_FOUND", message: "Soundfont/channel not found", details: nil))
             return
         }
-        sampler.sendController(UInt8(controller), withValue: UInt8(value), onChannel: UInt8(channel))
+        sampler.sendController(UInt8(controller), withValue: UInt8(value), onChannel: Self.samplerMidiChannel)
         result(nil)
     case "selectInstrument":
         let args = call.arguments as! [String: Any]
@@ -168,19 +338,28 @@ public class FlutterMidiProPlugin: NSObject, FlutterPlugin {
         let channel = args["channel"] as! Int
         let bank = args["bank"] as! Int
         let program = args["program"] as! Int
-        let soundfontSampler = soundfontSamplers[sfId]![channel]
-        let soundfontUrl = soundfontURLs[sfId]!
-        do {
-            let isPercussion = (bank == 128)
-            let bankMSB: UInt8 = isPercussion ? UInt8(kAUSampler_DefaultPercussionBankMSB) : UInt8(kAUSampler_DefaultMelodicBankMSB)
-            let bankLSB: UInt8 = isPercussion ? 0 : UInt8(bank)
-            
-            try soundfontSampler.loadSoundBankInstrument(at: soundfontUrl, program: UInt8(program), bankMSB: bankMSB, bankLSB: bankLSB)
-        } catch {
-            result(FlutterError(code: "SOUND_FONT_LOAD_FAILED2", message: "Failed to load soundfont", details: nil))
+        let selection = InstrumentSelection(bank: bank, program: program)
+        let key = channelKey(sfId: sfId, channel: channel)
+        // After stopAllNotes the engines are stopped; reusing the cached
+        // selection without reloading leaves muffled/wrong timbre on iOS.
+        if selectedInstruments[sfId]?[channel] == selection,
+           activeChannelKeys.contains(key) {
+            result(nil)
             return
         }
-        soundfontSampler.sendProgramChange(UInt8(program), bankMSB: UInt8(kAUSampler_DefaultMelodicBankMSB), bankLSB: UInt8(bank), onChannel: UInt8(channel))
+        ensureChannelEngineRunning(sfId: sfId, channel: channel)
+        let soundfontSampler = soundfontSamplers[sfId]![channel]
+        let soundfontUrl = soundfontURLs[sfId]!
+        applyInstrumentSelection(
+            sampler: soundfontSampler,
+            url: soundfontUrl,
+            bank: bank,
+            program: program
+        )
+        if selectedInstruments[sfId] == nil {
+            selectedInstruments[sfId] = [:]
+        }
+        selectedInstruments[sfId]![channel] = selection
         result(nil)
     case "playNote":
         let args = call.arguments as! [String: Any]
@@ -188,8 +367,9 @@ public class FlutterMidiProPlugin: NSObject, FlutterPlugin {
         let note = args["key"] as! Int
         let velocity = args["velocity"] as! Int
         let sfId = args["sfId"] as! Int
+        ensureChannelEngineRunning(sfId: sfId, channel: channel)
         let soundfontSampler = soundfontSamplers[sfId]![channel]
-        soundfontSampler.startNote(UInt8(note), withVelocity: UInt8(velocity), onChannel: UInt8(channel))
+        soundfontSampler.startNote(UInt8(note), withVelocity: UInt8(velocity), onChannel: Self.samplerMidiChannel)
         result(nil)
     case "stopNote":
         let args = call.arguments as! [String: Any]
@@ -197,7 +377,7 @@ public class FlutterMidiProPlugin: NSObject, FlutterPlugin {
         let note = args["key"] as! Int
         let sfId = args["sfId"] as! Int
         let soundfontSampler = soundfontSamplers[sfId]![channel]
-        soundfontSampler.stopNote(UInt8(note), onChannel: UInt8(channel))
+        soundfontSampler.stopNote(UInt8(note), onChannel: Self.samplerMidiChannel)
         result(nil)
     case "unloadSoundfont":
         let args = call.arguments as! [String:Any]
@@ -207,21 +387,23 @@ public class FlutterMidiProPlugin: NSObject, FlutterPlugin {
             result(FlutterError(code: "SOUND_FONT_NOT_FOUND", message: "Soundfont not found", details: nil))
             return
         }
-        audioEngines[sfId]?.forEach { (audioEngine) in
-            audioEngine.stop()
-        }
+        stopEngines(for: sfId)
         audioEngines.removeValue(forKey: sfId)
         soundfontSamplers.removeValue(forKey: sfId)
         soundfontURLs.removeValue(forKey: sfId)
+        selectedInstruments.removeValue(forKey: sfId)
         result(nil)
     case "dispose":
-        audioEngines.forEach { (key, value) in
-            value.forEach { (audioEngine) in
-                audioEngine.stop()
+        audioEngines.forEach { (_, engines) in
+            engines.forEach { engine in
+                engine.stop()
             }
         }
         audioEngines = [:]
         soundfontSamplers = [:]
+        soundfontURLs = [:]
+        selectedInstruments = [:]
+        activeChannelKeys = []
         playbackStandardA4 = Self.defaultPlaybackStandardA4
         result(nil)
     case "setPlaybackStandard":
@@ -240,6 +422,17 @@ public class FlutterMidiProPlugin: NSObject, FlutterPlugin {
         result(nil)
     case "getPlaybackStandard":
         result(playbackStandardA4)
+    case "syncAudioEngine":
+        let args = call.arguments as! [String: Any]
+        let sfId = args["sfId"] as! Int
+        guard let engines = audioEngines[sfId] else {
+            result(FlutterError(code: "SOUND_FONT_NOT_FOUND", message: "Soundfont not found", details: nil))
+            return
+        }
+        for channel in engines.indices where activeChannelKeys.contains(channelKey(sfId: sfId, channel: channel)) {
+            ensureChannelEngineRunning(sfId: sfId, channel: channel)
+        }
+        result(nil)
     default:
       result(FlutterMethodNotImplemented)
         break

@@ -164,6 +164,9 @@ class FlutterMidiProPlugin: FlutterPlugin, MethodCallHandler {
       "getPlaybackStandard" -> {
         result.success(getPlaybackStandard())
       }
+      "syncAudioEngine" -> {
+        result.success(null)
+      }
       else -> result.notImplemented()
     }
   }
