@@ -76,4 +76,17 @@ class MethodChannelFlutterMidiPro extends FlutterMidiProPlatform {
     final standard = await _channel.invokeMethod<double>('getPlaybackStandard');
     return standard ?? 440.0;
   }
+
+  @override
+  Future<void> playMidiBuffer(int sfId, Uint8List midiData) async {
+    await _channel.invokeMethod('playMidiBuffer', {
+      'sfId': sfId,
+      'midiData': midiData,
+    });
+  }
+
+  @override
+  Future<void> stopMidiPlayer(int sfId) async {
+    await _channel.invokeMethod('stopMidiPlayer', {'sfId': sfId});
+  }
 }

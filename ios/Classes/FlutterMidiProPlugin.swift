@@ -23,6 +23,11 @@ public class FlutterMidiProPlugin: NSObject, FlutterPlugin {
   private var activeChannelKeys: Set<Int> = []
   var playbackStandardA4 = defaultPlaybackStandardA4
 
+  // MIDI Player support (per sfId)
+  var midiSequencers: [Int: AVAudioSequencer] = [:]
+  var midiPlayerEngines: [Int: AVAudioEngine] = [:]
+  var midiPlayerSamplers: [Int: AVAudioUnitSampler] = [:]
+
   private func channelKey(sfId: Int, channel: Int) -> Int {
     return sfId * 16 + channel
   }
@@ -382,6 +387,16 @@ public class FlutterMidiProPlugin: NSObject, FlutterPlugin {
     case "unloadSoundfont":
         let args = call.arguments as! [String:Any]
         let sfId = args["sfId"] as! Int
+        // Stop & remove MIDI player
+        if let seq = midiSequencers[sfId] {
+            seq.stop()
+            midiSequencers.removeValue(forKey: sfId)
+        }
+        if let engine = midiPlayerEngines[sfId] {
+            engine.stop()
+            midiPlayerEngines.removeValue(forKey: sfId)
+        }
+        midiPlayerSamplers.removeValue(forKey: sfId)
         let soundfontSampler = soundfontSamplers[sfId]
         if soundfontSampler == nil {
             result(FlutterError(code: "SOUND_FONT_NOT_FOUND", message: "Soundfont not found", details: nil))
@@ -394,6 +409,12 @@ public class FlutterMidiProPlugin: NSObject, FlutterPlugin {
         selectedInstruments.removeValue(forKey: sfId)
         result(nil)
     case "dispose":
+        // Stop MIDI players
+        midiSequencers.forEach { $0.value.stop() }
+        midiSequencers = [:]
+        midiPlayerEngines.forEach { $0.value.stop() }
+        midiPlayerEngines = [:]
+        midiPlayerSamplers = [:]
         audioEngines.forEach { (_, engines) in
             engines.forEach { engine in
                 engine.stop()
@@ -432,6 +453,76 @@ public class FlutterMidiProPlugin: NSObject, FlutterPlugin {
         for channel in engines.indices where activeChannelKeys.contains(channelKey(sfId: sfId, channel: channel)) {
             ensureChannelEngineRunning(sfId: sfId, channel: channel)
         }
+        result(nil)
+    case "playMidiBuffer":
+        let args = call.arguments as! [String: Any]
+        let sfId = args["sfId"] as! Int
+        let midiData = args["midiData"] as! FlutterStandardTypedData
+        // Stop existing player
+        if let oldSeq = midiSequencers[sfId] {
+            oldSeq.stop()
+            midiSequencers.removeValue(forKey: sfId)
+        }
+        if let oldEngine = midiPlayerEngines[sfId] {
+            oldEngine.stop()
+            midiPlayerEngines.removeValue(forKey: sfId)
+        }
+        midiPlayerSamplers.removeValue(forKey: sfId)
+
+        guard let sfUrl = soundfontURLs[sfId] else {
+            result(FlutterError(code: "SOUND_FONT_NOT_FOUND", message: "Soundfont not loaded", details: nil))
+            return
+        }
+
+        let engine = AVAudioEngine()
+        let sampler = AVAudioUnitSampler()
+        engine.attach(sampler)
+        engine.connect(sampler, to: engine.mainMixerNode, format: nil)
+        do {
+            try engine.start()
+        } catch {
+            result(FlutterError(code: "ENGINE_START_FAILED", message: "\(error)", details: nil))
+            return
+        }
+        // Load soundfont into the player sampler
+        do {
+            try runOnMainThread {
+                try self.loadInstrument(sampler: sampler, url: sfUrl, bank: 0, program: 0)
+            }
+        } catch {
+            result(FlutterError(code: "INSTRUMENT_LOAD_FAILED", message: "\(error)", details: nil))
+            return
+        }
+
+        let sequencer = AVAudioSequencer(audioEngine: engine)
+        do {
+            try sequencer.load(from: midiData.data, options: .smf)
+        } catch {
+            result(FlutterError(code: "MIDI_LOAD_FAILED", message: "\(error)", details: nil))
+            return
+        }
+        do {
+            try sequencer.start()
+        } catch {
+            result(FlutterError(code: "MIDI_START_FAILED", message: "\(error)", details: nil))
+            return
+        }
+        midiSequencers[sfId] = sequencer
+        midiPlayerEngines[sfId] = engine
+        midiPlayerSamplers[sfId] = sampler
+        result(nil)
+    case "stopMidiPlayer":
+        let args = call.arguments as! [String: Any]
+        let sfId = args["sfId"] as! Int
+        if let seq = midiSequencers[sfId] {
+            seq.stop()
+            midiSequencers.removeValue(forKey: sfId)
+        }
+        if let engine = midiPlayerEngines[sfId] {
+            engine.stop()
+            midiPlayerEngines.removeValue(forKey: sfId)
+        }
+        midiPlayerSamplers.removeValue(forKey: sfId)
         result(nil)
     default:
       result(FlutterMethodNotImplemented)

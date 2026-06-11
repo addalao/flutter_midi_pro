@@ -207,6 +207,27 @@ class MidiPro {
     return FlutterMidiProPlatform.instance.getPlaybackStandard();
   }
 
+  /// Plays a MIDI file from a memory buffer using FluidSynth's built-in player
+  /// (Android) or AVAudioSequencer (iOS).
+  ///
+  /// [midiData] must be a valid Standard MIDI File (.mid) as bytes.
+  /// Playback runs on the native audio thread with sample-accurate timing.
+  ///
+  /// Call [stopMidiPlayer] to stop playback early.
+  /// While the player is running, [controlChange] and [playNote] still work
+  /// for real-time control (e.g., changing volume per channel).
+  Future<void> playMidiBuffer({
+    required int sfId,
+    required Uint8List midiData,
+  }) {
+    return FlutterMidiProPlatform.instance.playMidiBuffer(sfId, midiData);
+  }
+
+  /// Stops the MIDI player previously started via [playMidiBuffer].
+  Future<void> stopMidiPlayer({required int sfId}) {
+    return FlutterMidiProPlatform.instance.stopMidiPlayer(sfId);
+  }
+
   /// Disposes of the FlutterMidiPro instance.
   /// This should be called when the instance is no longer needed.
   /// This will stop all notes and unload all soundfonts.

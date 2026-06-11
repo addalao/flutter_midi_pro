@@ -50,6 +50,12 @@ class FlutterMidiProPlugin: FlutterPlugin, MethodCallHandler {
     @JvmStatic
     private external fun getPlaybackStandard(): Double
 
+    @JvmStatic
+    private external fun playMidiBuffer(sfId: Int, midiData: ByteArray)
+
+    @JvmStatic
+    private external fun stopMidiPlayer(sfId: Int)
+
     private const val MIN_PLAYBACK_STANDARD = 400.0
     private const val MAX_PLAYBACK_STANDARD = 480.0
   }
@@ -165,6 +171,21 @@ class FlutterMidiProPlugin: FlutterPlugin, MethodCallHandler {
         result.success(getPlaybackStandard())
       }
       "syncAudioEngine" -> {
+        result.success(null)
+      }
+      "playMidiBuffer" -> {
+        val sfId = call.argument<Int>("sfId") ?: 1
+        val midiData = call.argument<ByteArray>("midiData")
+        if (midiData != null) {
+          playMidiBuffer(sfId, midiData)
+          result.success(null)
+        } else {
+          result.error("INVALID_ARGUMENT", "midiData is required", null)
+        }
+      }
+      "stopMidiPlayer" -> {
+        val sfId = call.argument<Int>("sfId") ?: 1
+        stopMidiPlayer(sfId)
         result.success(null)
       }
       else -> result.notImplemented()

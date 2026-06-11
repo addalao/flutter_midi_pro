@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:flutter_midi_pro/flutter_midi_pro_method_channel.dart';
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 
@@ -64,5 +66,21 @@ abstract class FlutterMidiProPlatform extends PlatformInterface {
   /// Returns the current A4 reference frequency (Hz) used for playback tuning.
   Future<double> getPlaybackStandard() {
     throw UnimplementedError('getPlaybackStandard() has not been implemented.');
+  }
+
+  /// Plays a MIDI file from a memory buffer using FluidSynth's built-in player
+  /// (Android) or AVAudioSequencer (iOS).
+  ///
+  /// The [midiData] must be a valid Standard MIDI File (.mid) as bytes.
+  /// Playback runs on the native audio thread with sample-accurate timing.
+  ///
+  /// Call [stopMidiPlayer] to stop playback early.
+  Future<void> playMidiBuffer(int sfId, Uint8List midiData) {
+    throw UnimplementedError('playMidiBuffer() has not been implemented.');
+  }
+
+  /// Stops the MIDI player previously started via [playMidiBuffer].
+  Future<void> stopMidiPlayer(int sfId) {
+    throw UnimplementedError('stopMidiPlayer() has not been implemented.');
   }
 }
