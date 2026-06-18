@@ -277,6 +277,157 @@ public class FlutterMidiProPlugin: NSObject, FlutterPlugin {
     }
   }
 
+  // ──────────────────────────────────────────────────────────
+  // MARK: - MIDI file parsing for sampler pre-configuration
+  // ──────────────────────────────────────────────────────────
+
+  /// Parses MIDI data and pre-configures each channel's instrument on the
+  /// sampler using `loadSoundBankInstrument` + `sendProgramChange` (same
+  /// strategy as `selectInstrument` / `applyInstrumentSelection`).
+  ///
+  /// Also patches Bank Select MSB (CC 0) values in the MIDI data so that
+  /// the `AVAudioSequencer` sends the correct values (121 for melodic, 120
+  /// for percussion) instead of the raw MIDI halves — this prevents the
+  /// sequencer from resetting the bank to 0 after we configure it.
+  ///
+  /// Returns the patched MIDI data for the sequencer.
+  private func patchMidiForSampler(sampler: AVAudioUnitSampler, midiData: Data, sfUrl: URL) -> Data {
+    let bytes = [UInt8](midiData)
+    var patched = Data(midiData)
+
+    var cc0 = [UInt8](repeating: 0, count: 16)
+    var cc32 = [UInt8](repeating: 0, count: 16)
+    var applied = Set<Int>()
+
+    guard bytes.count >= 14 else { return midiData }
+    guard String(bytes: Data(bytes[0..<4]), encoding: .ascii) == "MThd" else { return midiData }
+    var pos = 14
+
+    while pos + 8 <= bytes.count {
+      let chunkLen = (UInt32(bytes[pos+4]) << 24) | (UInt32(bytes[pos+5]) << 16) |
+                     (UInt32(bytes[pos+6]) << 8)  | UInt32(bytes[pos+7])
+      pos += 8
+      let trackEnd = pos + Int(chunkLen)
+      guard trackEnd <= bytes.count else { break }
+
+      var runningStatus: UInt8 = 0
+      while pos < trackEnd {
+        // Delta time (variable length)
+        while true {
+          guard pos < trackEnd else { break }
+          let b = bytes[pos]; pos += 1
+          if b & 0x80 == 0 { break }
+        }
+        guard pos < trackEnd else { break }
+
+        var status = bytes[pos]
+        if status & 0x80 == 0 {
+          status = runningStatus
+        } else {
+          pos += 1
+          runningStatus = status
+        }
+
+        let ch = Int(status & 0x0F)
+
+        switch status & 0xF0 {
+        case 0xB0:
+          guard pos + 1 < trackEnd else { break }
+          let ctrl = bytes[pos]
+          let val = bytes[pos + 1]
+          pos += 2
+          if ctrl == 0 {
+            cc0[ch] = val
+            // Patch CC 0 value in the MIDI data copy
+            let rawBank = Int(val) * 128 + Int(cc32[ch])
+            let isPerc = rawBank >= 128 || val >= 120
+            let corrected: UInt8 = isPerc
+                ? UInt8(kAUSampler_DefaultPercussionBankMSB)
+                : UInt8(kAUSampler_DefaultMelodicBankMSB)
+            if val != corrected { patched[pos - 1] = corrected }
+          } else if ctrl == 32 {
+            cc32[ch] = val
+          }
+
+        case 0xC0:
+          guard pos < trackEnd else { break }
+          let program = bytes[pos]
+          pos += 1
+
+          let rawBank = Int(cc0[ch]) * 128 + Int(cc32[ch])
+          let isPerc = rawBank >= 128 || cc0[ch] >= 120
+          let msb: UInt8 = isPerc
+              ? UInt8(kAUSampler_DefaultPercussionBankMSB)
+              : UInt8(kAUSampler_DefaultMelodicBankMSB)
+          let lsb: UInt8 = isPerc ? 0 : cc32[ch]
+
+          // Call loadSoundBankInstrument once for the very first Program
+          // Change encountered, to ensure the sampler's default preset is
+          // correct (not piano).  Subsequent channels use sendProgramChange
+          // on their respective MIDI channel without reloading the soundfont,
+          // which avoids resetting the shared sampler's state.
+          if !applied.contains(ch) && applied.isEmpty {
+            // First-ever PC → load the preset so the sampler has it ready
+            let bankForLoad = isPerc ? 128 : Int(cc32[ch])
+            for attempt in self.bankLoadAttempts(for: bankForLoad, program: Int(program)) {
+              do {
+                try self.runOnMainThread {
+                  try sampler.loadSoundBankInstrument(
+                    at: sfUrl, program: program,
+                    bankMSB: attempt.bankMSB, bankLSB: attempt.bankLSB
+                  )
+                  sampler.globalTuning = self.globalTuningCents(for: self.playbackStandardA4)
+                }
+                break
+              } catch { continue }
+            }
+          }
+
+          // Always send sendProgramChange for every channel.  This
+          // pre-configures the sampler per-channel before the sequencer
+          // starts; the sequencer's own (patched) MIDI events reinforce it.
+          if !applied.contains(ch) {
+            applied.insert(ch)
+            // sendProgramChange is thread-safe; no try needed.
+            sampler.sendProgramChange(
+              program, bankMSB: msb, bankLSB: lsb,
+              onChannel: UInt8(ch)
+            )
+          }
+
+        case 0x80, 0x90, 0xA0, 0xD0, 0xE0:
+          pos += min((status & 0xF0 == 0xD0) ? 1 : 2, trackEnd - pos)
+
+        case 0xF0:
+          if status == 0xFF {
+            guard pos < trackEnd else { break }
+            let mt = bytes[pos]; pos += 1
+            var len: UInt32 = 0; var s: UInt32 = 0
+            while pos < trackEnd {
+              let b = bytes[pos]; pos += 1
+              len |= (UInt32(b & 0x7F) << s); s += 7
+              if b & 0x80 == 0 { break }
+            }
+            pos += min(Int(len), trackEnd - pos)
+            if mt == 0x2F { break }
+          } else {
+            var len: UInt32 = 0; var s: UInt32 = 0
+            while pos < trackEnd {
+              let b = bytes[pos]; pos += 1
+              len |= (UInt32(b & 0x7F) << s); s += 7
+              if b & 0x80 == 0 { break }
+            }
+            pos += min(Int(len), trackEnd - pos)
+          }
+
+        default:
+          pos += 1
+        }
+      }
+    }
+    return patched
+  }
+
   public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
     switch call.method {
     case "loadSoundfont":
@@ -458,45 +609,65 @@ public class FlutterMidiProPlugin: NSObject, FlutterPlugin {
         let args = call.arguments as! [String: Any]
         let sfId = args["sfId"] as! Int
         let midiData = args["midiData"] as! FlutterStandardTypedData
-        // Stop existing player
+
+        // 停止旧的 sequencer（保留 engine/sampler 以便复用）
         if let oldSeq = midiSequencers[sfId] {
             oldSeq.stop()
             midiSequencers.removeValue(forKey: sfId)
         }
-        if let oldEngine = midiPlayerEngines[sfId] {
-            oldEngine.stop()
-            midiPlayerEngines.removeValue(forKey: sfId)
-        }
-        midiPlayerSamplers.removeValue(forKey: sfId)
 
         guard let sfUrl = soundfontURLs[sfId] else {
             result(FlutterError(code: "SOUND_FONT_NOT_FOUND", message: "Soundfont not loaded", details: nil))
             return
         }
 
-        let engine = AVAudioEngine()
-        let sampler = AVAudioUnitSampler()
-        engine.attach(sampler)
-        engine.connect(sampler, to: engine.mainMixerNode, format: nil)
-        do {
-            try engine.start()
-        } catch {
-            result(FlutterError(code: "ENGINE_START_FAILED", message: "\(error)", details: nil))
-            return
-        }
-        // Load soundfont into the player sampler
-        do {
-            try runOnMainThread {
-                try self.loadInstrument(sampler: sampler, url: sfUrl, bank: 0, program: 0)
+        // 复用或创建 engine + sampler
+        let engine: AVAudioEngine
+        let sampler: AVAudioUnitSampler
+        if let existingEngine = midiPlayerEngines[sfId],
+           let existingSampler = midiPlayerSamplers[sfId] {
+            engine = existingEngine
+            sampler = existingSampler
+        } else {
+            engine = AVAudioEngine()
+            sampler = AVAudioUnitSampler()
+            engine.attach(sampler)
+            engine.connect(sampler, to: engine.mainMixerNode, format: nil)
+            do {
+                try engine.start()
+            } catch {
+                result(FlutterError(code: "ENGINE_START_FAILED", message: "\(error)", details: nil))
+                return
             }
-        } catch {
-            result(FlutterError(code: "INSTRUMENT_LOAD_FAILED", message: "\(error)", details: nil))
-            return
+            // Load soundfont into the player sampler (use a known-good default)
+            do {
+                try runOnMainThread {
+                    try self.loadInstrument(sampler: sampler, url: sfUrl, bank: 0, program: 0)
+                }
+            } catch {
+                result(FlutterError(code: "INSTRUMENT_LOAD_FAILED", message: "\(error)", details: nil))
+                return
+            }
+            midiPlayerEngines[sfId] = engine
+            midiPlayerSamplers[sfId] = sampler
         }
+
+        // ── Reset sampler channels ──
+        // 复用 sampler 时，旧播放残留的 CC 值（如 CC 7 音量=0）、持续延音、
+        // 未释放的踏板、以及旧的 Program Change 会干扰新播放。
+        // 发 All Sound Off + All Notes Off 清除所有通道的持续状态。
+        for ch in 0..<16 {
+            sampler.sendController(64,  withValue: 0, onChannel: UInt8(ch)) // Sustain Off
+            sampler.sendController(120, withValue: 0, onChannel: UInt8(ch)) // All Sound Off
+            sampler.sendController(121, withValue: 0, onChannel: UInt8(ch)) // All Notes Off
+        }
+
+        // ── Patch MIDI Bank Select & pre-configure sampler channels ──
+        let patchedMidi = self.patchMidiForSampler(sampler: sampler, midiData: midiData.data, sfUrl: sfUrl)
 
         let sequencer = AVAudioSequencer(audioEngine: engine)
         do {
-            try sequencer.load(from: midiData.data, options: .smf)
+            try sequencer.load(from: patchedMidi)
         } catch {
             result(FlutterError(code: "MIDI_LOAD_FAILED", message: "\(error)", details: nil))
             return
@@ -508,21 +679,17 @@ public class FlutterMidiProPlugin: NSObject, FlutterPlugin {
             return
         }
         midiSequencers[sfId] = sequencer
-        midiPlayerEngines[sfId] = engine
-        midiPlayerSamplers[sfId] = sampler
         result(nil)
     case "stopMidiPlayer":
         let args = call.arguments as! [String: Any]
         let sfId = args["sfId"] as! Int
+        // 停止 sequencer，但保留 engine + sampler 以便下次快速启动
         if let seq = midiSequencers[sfId] {
             seq.stop()
             midiSequencers.removeValue(forKey: sfId)
         }
-        if let engine = midiPlayerEngines[sfId] {
-            engine.stop()
-            midiPlayerEngines.removeValue(forKey: sfId)
-        }
-        midiPlayerSamplers.removeValue(forKey: sfId)
+        // Note: engine 和 sampler 保持存活，避免下次 playMidiBuffer 时
+        // 重复创建 AVAudioEngine / 加载 SoundFont 的开销。
         result(nil)
     default:
       result(FlutterMethodNotImplemented)
